@@ -5,30 +5,60 @@ use std::{io::{Read, Write}, net::{TcpListener, TcpStream}};
 
 // response header v0 contains single field: correlation_id which lets the client match responses with requests
 // it is a 32-bit signed integer
+fn extract_corr_id(buff: &[u8]) -> i32 {
+    if buff.len() < 8 {
+        eprintln!("Request too short to contain a correlation_id.");
+        return 0;
+    }
+
+    let mut corr_id_bytes = [0; 4];
+    corr_id_bytes.copy_from_slice(&buff[4..8]);
+    i32::from_be_bytes(corr_id_bytes)
+}
+
+// response header v0 contains single field: correlation_id which lets the client match responses with requests
+// it is a 32-bit signed integer
 fn handle_client(mut stream: TcpStream) {
-    // buffer to read the incoming request
-    let mut buffer = [0; 1024];
+    // reading exact 4 bytes for message size
+    let mut size_buffer = [0; 4];
+    if stream.read_exact(&mut size_buffer).is_err() {
+        eprintln!("Failed to read message size");
+        return;
+    }
 
-    // read the incoming request
-    let _ = stream.read(&mut buffer).unwrap();
+    let message_size = i32::from_be_bytes(size_buffer);
 
-    // construct the response
-    let message_size: i32 = 0;
-    let correlation_id: i32 = 7;
+    if message_size <= 0 || message_size as usize > 1024 {
+        eprintln!("Invalid message size: {}", message_size);
+        return;
+    }
 
+    // read the remaining bytes based on the message size
+    let mut buffer = vec![0; message_size as usize];
+    if stream.read_exact(&mut buffer).is_err() {
+        eprintln!("Failed to read message");
+        return;
+    }
+
+    let correlation_id = extract_corr_id(&buffer);
     // need big endian to match the kafka protocol
-    let message_size_bytes = message_size.to_be_bytes();
     let correlation_id_bytes = correlation_id.to_be_bytes();
 
     // construct the response
     let mut res = Vec::new();
-    res.extend_from_slice(&message_size_bytes);
+    res.extend_from_slice(&[0, 0, 0, 0]);
     res.extend_from_slice(&correlation_id_bytes);
 
-    stream.write_all(&res).unwrap();
-    stream.flush().unwrap();
+    // write the response back to the client
+    match stream.write_all(&res) {
+        Ok(_) => {
+            println!("response sent successfully");
+        }
+        Err(e) => {
+            eprintln!("Failed to send response: {}", e);
+        }
+    }
 }
-
 
 fn main() {
     let listener = TcpListener::bind("127.0.0.1:9092").unwrap();

@@ -1,10 +1,14 @@
-use std::{io::{Read, Write}, net::{TcpListener, TcpStream}};
+use bytes::BufMut;
+use std::{
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
+};
 
 const MAX_MESSAGE_SIZE: usize = 1024;
 const SUPPORTED_VERSION_MIN: i16 = 0;
 const SUPPORTED_VERSION_MAX: i16 = 4;
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 enum KafkaErrorCode {
     None = 0,
     UnsupportedVersion = 35,
@@ -14,18 +18,6 @@ impl From<KafkaErrorCode> for i16 {
     fn from(error: KafkaErrorCode) -> i16 {
         error as i16
     }
-}
-
-struct RequestHeader {
-    api_key: i16,
-    api_version: i16,
-    correlation_id: i32,
-}
-
-#[derive(Debug)]
-struct ResponseHeader {
-    correlation_id: i32,
-    error_code: KafkaErrorCode,
 }
 
 #[derive(Debug)]
@@ -44,34 +36,49 @@ impl From<std::io::Error> for ServerError {
 struct MessageParser;
 
 impl MessageParser {
-    fn extract_helper(buffer: &[u8], start: usize, len: usize) -> Option<i32> {
-        if buffer.len() < start + len {
-            eprintln!("Request too short to extract field.");
-            return None;
-        }
-        let mut bytes = [0; 4];
-        bytes.copy_from_slice(&buffer[start..start + len]);
-        Some(i32::from_be_bytes(bytes))
+    fn read_exact_bytes(stream: &mut TcpStream, size: usize) -> Result<Vec<u8>, ServerError> {
+        let mut buffer = vec![0; size];
+        stream.read_exact(&mut buffer)?;
+        Ok(buffer)
     }
 
-    fn extract_corr_id(buffer: &[u8]) -> i32 {
-        Self::extract_helper(buffer, 4, 4).unwrap_or(0)
+    fn read_i32(stream: &mut TcpStream) -> Result<i32, ServerError> {
+        let buffer = Self::read_exact_bytes(stream, 4)?;
+        Ok(i32::from_be_bytes(buffer.try_into().unwrap()))
     }
 
-    fn extract_api_info(buffer: &[u8]) -> Result<(i16, i16), ServerError> {
-        if buffer.len() < 4 {
-            return Err(ServerError::MessageTooShort);
-        }
-
-        let api_key = i16::from_be_bytes([buffer[0], buffer[1]]);
-        let api_version = i16::from_be_bytes([buffer[2], buffer[3]]);
-        Ok((api_key, api_version))
+    fn read_i16(stream: &mut TcpStream) -> Result<i16, ServerError> {
+        let buffer = Self::read_exact_bytes(stream, 2)?;
+        Ok(i16::from_be_bytes(buffer.try_into().unwrap()))
     }
 }
 
-// api versions in req and resp are same --> Produce Request (Version: 3) and Produce Response (Version: 3)
-// indicates that apiversions requested by the client is not supported by the broker. assuming broker only supports 0 to 4.
-// broker must send must send an ApiVersions version 4 response with the error_code field set to 35(UNSUPPORTED_VERSION)
+struct ResponseBuilder;
+
+impl ResponseBuilder {
+    fn build_api_versions_response(correlation_id: i32, error_code: KafkaErrorCode) -> Vec<u8> {
+        let mut data = Vec::new();
+        
+        // Response body
+        data.put_i32(correlation_id);
+        data.put_i16(i16::from(error_code));
+        data.put_i8(2); // num api key records + 1
+        data.put_i16(18); // api key
+        data.put_i16(0); // min version
+        data.put_i16(4); // max version
+        data.put_i8(0); // TAG_BUFFER length
+        data.put_i32(420); // throttle time ms
+        data.put_i8(0); // TAG_BUFFER length
+
+        // Wrap with message size
+        let mut response = Vec::new();
+        response.put_i32(data.len() as i32);
+        response.extend(data);
+        
+        response
+    }
+}
+
 struct KafkaServer {
     listener: TcpListener,
 }
@@ -82,26 +89,31 @@ impl KafkaServer {
         Ok(KafkaServer { listener })
     }
 
-    fn read_message_size(&self, stream: &mut TcpStream) -> Result<i32, ServerError> {
-        let mut size_buffer = [0; 4];
-        // reading exact 4 bytes for message size
-        stream.read_exact(&mut size_buffer)?;
-
-        let message_size = i32::from_be_bytes(size_buffer);
-        if message_size <= 0 || message_size as usize > MAX_MESSAGE_SIZE {
-            return Err(ServerError::InvalidMessageSize(message_size));
+    fn validate_message_size(&self, size: i32) -> Result<(), ServerError> {
+        if size <= 0 || size as usize > MAX_MESSAGE_SIZE {
+            return Err(ServerError::InvalidMessageSize(size));
         }
-        Ok(message_size)
+        Ok(())
+    }
+
+    fn read_request(&self, stream: &mut TcpStream) -> Result<(i16, i16, i32), ServerError> {
+        let message_size = MessageParser::read_i32(stream)?;
+        self.validate_message_size(message_size)?;
+
+        let api_key = MessageParser::read_i16(stream)?;
+        let api_version = MessageParser::read_i16(stream)?;
+        let correlation_id = MessageParser::read_i32(stream)?;
+
+        // Read remaining bytes
+        let remaining_size = message_size as usize - 8; // 8 bytes already read (api_key + api_version + correlation_id)
+        let mut remaining = vec![0; remaining_size];
+        stream.read_exact(&mut remaining)?;
+
+        Ok((api_key, api_version, correlation_id))
     }
 
     fn handle_client(&self, mut stream: TcpStream) -> Result<(), ServerError> {
-        let message_size = self.read_message_size(&mut stream)?;
-
-        let mut buffer = vec![0; message_size as usize];
-        stream.read_exact(&mut buffer)?;
-
-        let correlation_id = MessageParser::extract_corr_id(&buffer);
-        let (_, api_version) = MessageParser::extract_api_info(&buffer)?;
+        let (api_key, api_version, correlation_id) = self.read_request(&mut stream)?;
 
         let error_code = if api_version < SUPPORTED_VERSION_MIN || api_version > SUPPORTED_VERSION_MAX {
             KafkaErrorCode::UnsupportedVersion
@@ -109,26 +121,17 @@ impl KafkaServer {
             KafkaErrorCode::None
         };
 
-        let response = ResponseHeader {
-            correlation_id,
-            error_code,
+        let response = if api_key == 18 {
+            ResponseBuilder::build_api_versions_response(correlation_id, error_code)
+        } else {
+            Vec::new() // Handle other API types if needed
         };
 
-        self.send_response(&mut stream, &response)?;
-        println!("Response sent successfully");
-        Ok(())
-    }
+        if !response.is_empty() {
+            stream.write_all(&response)?;
+            println!("Response sent successfully");
+        }
 
-    fn send_response(&self, stream: &mut TcpStream, response: &ResponseHeader) -> Result<(), ServerError> {
-        let mut res = Vec::new();
-        res.extend_from_slice(&[0, 0, 0, 0]); // message size placeholder
-        res.extend_from_slice(&response.correlation_id.to_be_bytes());
-        res.extend_from_slice(&i16::from(response.error_code).to_be_bytes());
-
-        let message_size = (res.len() - 4) as i32;
-        res[0..4].copy_from_slice(&message_size.to_be_bytes());
-
-        stream.write_all(&res)?;
         Ok(())
     }
 

@@ -1,4 +1,3 @@
-use bytes::BufMut;
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
@@ -24,7 +23,6 @@ impl From<KafkaErrorCode> for i16 {
 enum ServerError {
     IoError(std::io::Error),
     InvalidMessageSize(i32),
-    MessageTooShort,
 }
 
 impl From<std::io::Error> for ServerError {
@@ -55,27 +53,51 @@ impl MessageParser {
 
 struct ResponseBuilder;
 
-impl ResponseBuilder {
-    fn build_api_versions_response(correlation_id: i32, error_code: KafkaErrorCode) -> Vec<u8> {
+macro_rules! kafka_response {
+    (
+        correlation_id: $correlation_id:expr,
+        error_code: $error_code:expr,
+        $(
+            $field:ident($type:ident): $value:expr
+        ),* $(,)?
+    ) => {{
         let mut data = Vec::new();
         
-        // Response body
-        data.put_i32(correlation_id);
-        data.put_i16(i16::from(error_code));
-        data.put_i8(2); // num api key records + 1
-        data.put_i16(18); // api key
-        data.put_i16(0); // min version
-        data.put_i16(4); // max version
-        data.put_i8(0); // TAG_BUFFER length
-        data.put_i32(420); // throttle time ms
-        data.put_i8(0); // TAG_BUFFER length
-
-        // Wrap with message size
-        let mut response = Vec::new();
-        response.put_i32(data.len() as i32);
-        response.extend(data);
+        // standard kafka response header
+        data.extend_from_slice(&($correlation_id as i32).to_be_bytes());
+        data.extend_from_slice(&(i16::from($error_code)).to_be_bytes());
         
+        $(
+            match stringify!($type) {
+                "i32" => data.extend_from_slice(&($value as i32).to_be_bytes()),
+                "i16" => data.extend_from_slice(&($value as i16).to_be_bytes()),
+                "i8" => data.push($value as u8),
+                _ => panic!("Unsupported type for {}: {}", stringify!($field), stringify!($type)),
+            }
+        )*
+        
+        // wrapping with message size
+        let mut response = Vec::new();
+        response.extend_from_slice(&(data.len() as i32).to_be_bytes());
+        response.extend(data);
         response
+    }};
+}
+
+impl ResponseBuilder {
+    fn build_api_versions_response(correlation_id: i32, error_code: KafkaErrorCode) -> Vec<u8> {
+    kafka_response! {
+            correlation_id: correlation_id,
+            error_code: error_code,
+            
+            num_api_keys(i8): 2,
+            api_key(i16): 18,
+            min_version(i16): 0,
+            max_version(i16): 4,
+            tag_buffer_1(i8): 0,
+            throttle_time(i32): 220,
+            tag_buffer_2(i8): 0,
+        }
     }
 }
 
@@ -112,26 +134,42 @@ impl KafkaServer {
         Ok((api_key, api_version, correlation_id))
     }
 
-    fn handle_client(&self, mut stream: TcpStream) -> Result<(), ServerError> {
-        let (api_key, api_version, correlation_id) = self.read_request(&mut stream)?;
+fn handle_client(&self, mut stream: TcpStream) -> Result<(), ServerError> {
+        // can handle multiple requests on the same connection
+        loop {
+            match self.read_request(&mut stream) {
+                Ok((api_key, api_version, correlation_id)) => {
+                    println!("Received request - API Key: {}, Version: {}, Correlation ID: {}", 
+                             api_key, api_version, correlation_id);
 
-        let error_code = if api_version < SUPPORTED_VERSION_MIN || api_version > SUPPORTED_VERSION_MAX {
-            KafkaErrorCode::UnsupportedVersion
-        } else {
-            KafkaErrorCode::None
-        };
+                    let error_code = if api_version < SUPPORTED_VERSION_MIN || api_version > SUPPORTED_VERSION_MAX {
+                        KafkaErrorCode::UnsupportedVersion
+                    } else {
+                        KafkaErrorCode::None
+                    };
 
-        let response = if api_key == 18 {
-            ResponseBuilder::build_api_versions_response(correlation_id, error_code)
-        } else {
-            Vec::new() // Handle other API types if needed
-        };
+                    let response = if api_key == 18 { // API_VERSIONS
+                        ResponseBuilder::build_api_versions_response(correlation_id, error_code)
+                    } else {
+                        // For unsupported API keys, return empty response or error
+                        Vec::new()
+                    };
 
-        if !response.is_empty() {
-            stream.write_all(&response)?;
-            println!("Response sent successfully");
+                    if !response.is_empty() {
+                        stream.write_all(&response)?;
+                        println!("Response sent successfully for correlation ID: {}", correlation_id);
+                    }
+                }
+                Err(ServerError::IoError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    println!("Client disconnected");
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("Error reading request: {:?}", e);
+                    break;
+                }
+            }
         }
-
         Ok(())
     }
 

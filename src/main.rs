@@ -1,6 +1,6 @@
 use std::{
     io::{Read, Write},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream}, thread,
 };
 
 const MAX_MESSAGE_SIZE: usize = 1024;
@@ -207,20 +207,25 @@ impl KafkaServer {
 
     // can handle multiple requests from a single client connection
     fn handle_client(&self, mut stream: TcpStream) -> Result<(), ServerError> {
+        let peer_addr = stream.peer_addr().unwrap_or_else(|e| {
+            eprintln!("Failed to get peer address: {}", e);
+            "0.0.0.0:0".parse().unwrap()
+        });
+
         loop {
             match self.read_request(&mut stream) {
                 Ok(request) => {
-                    println!("Processing request: {:?}", request);
+                    println!("Processing request from {}:  {:?}", peer_addr ,request);
 
                     let response = self.process_request(&request);
                     
                     if !response.is_empty() {
                         stream.write_all(&response)?;
-                        println!("Response sent for correlation ID: {}", request.correlation_id);
+                        println!("Response sent to {} for correlation ID: {}", peer_addr ,request.correlation_id);
                     }
                 }
                 Err(ServerError::IoError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    println!("Client disconnected gracefully");
+                    println!("Client {} disconnected gracefully", peer_addr);
                     break;
                 }
                 Err(e) => {
@@ -238,11 +243,15 @@ impl KafkaServer {
         for stream_result in self.listener.incoming() {
             match stream_result {
                 Ok(stream) => {
-                    println!("New client connected from: {:?}", stream.peer_addr());
-                    
-                    if let Err(e) = self.handle_client(stream) {
+                    let peer_addr = stream.peer_addr().unwrap_or_else(|_| "unknown".parse().unwrap());
+                    println!("New client connected from: {}", peer_addr);
+                    // not sharing data for now, so just spawn threads. TODO: arc, mutex
+                    thread::spawn(move || {
+                        let server = KafkaServer { listener: TcpListener::bind("127.0.0.1:0").unwrap() };
+                        if let Err(e) = server.handle_client(stream) {
                         eprintln!("Client handling error: {}", e);
-                    }
+                        }
+                    });
                 }
                 Err(e) => {
                     eprintln!("Failed to accept connection: {}", e);

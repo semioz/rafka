@@ -1,8 +1,6 @@
-use std::{
-    io::{Read, Write},
-    net::{TcpListener, TcpStream},
-    thread,
-};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::task;
 
 use crate::{
     constants::MAX_MESSAGE_SIZE,
@@ -12,14 +10,13 @@ use crate::{
 };
 
 pub struct KafkaServer {
-    listener: TcpListener,
+    address: String,
 }
 
 impl KafkaServer {
     pub fn new(address: &str) -> Result<Self, std::io::Error> {
-        let listener = TcpListener::bind(address)?;
         println!("Server bound to {}", address);
-        Ok(KafkaServer { listener })
+        Ok(KafkaServer { address: address.to_string() })
     }
 
     fn validate_message_size(&self, size: i32) -> Result<(), ServerError> {
@@ -32,19 +29,19 @@ impl KafkaServer {
         Ok(())
     }
 
-    fn read_request(&self, stream: &mut TcpStream) -> Result<KafkaRequest, ServerError> {
-        let message_size = MessageParser::read_i32(stream)?;
+    async fn  read_request(&self, stream: &mut TcpStream) -> Result<KafkaRequest, ServerError> {
+        let message_size = MessageParser::read_i32_async(stream).await?;
         self.validate_message_size(message_size)?;
 
-        let api_key = MessageParser::read_i16(stream)?;
-        let api_version = MessageParser::read_i16(stream)?;
-        let correlation_id = MessageParser::read_i32(stream)?;
+        let api_key = MessageParser::read_i16_async(stream).await?;
+        let api_version = MessageParser::read_i16_async(stream).await?;
+        let correlation_id = MessageParser::read_i32_async(stream).await?;
 
         // Read and discard remaining bytes to consume the entire request
         let remaining_size = message_size as usize - 8; // 8 bytes already read
         if remaining_size > 0 {
             let mut remaining = vec![0; remaining_size];
-            stream.read_exact(&mut remaining)?;
+            stream.read_exact(&mut remaining).await?;
         }
 
         Ok(KafkaRequest {
@@ -54,22 +51,22 @@ impl KafkaServer {
         })
     }
 
-    /// Handles multiple requests from a single client connection
-    fn handle_client(&self, mut stream: TcpStream) -> Result<(), ServerError> {
+    // multiple requests from a single client connection
+    async fn handle_client(&self, mut stream: TcpStream) -> Result<(), ServerError> {
         let peer_addr = stream.peer_addr().unwrap_or_else(|e| {
             eprintln!("Failed to get peer address: {}", e);
             "0.0.0.0:0".parse().unwrap()
         });
 
         loop {
-            match self.read_request(&mut stream) {
+            match self.read_request(&mut stream).await {
                 Ok(request) => {
                     println!("Processing request from {}: {:?}", peer_addr, request);
 
                     let response = KafkaProtocolHandler::process_request(&request);
                     
                     if !response.is_empty() {
-                        stream.write_all(&response)?;
+                        stream.write_all(&response).await?;
                         println!("Response sent to {} for correlation ID: {}", peer_addr, request.correlation_id);
                     }
                 }
@@ -86,33 +83,24 @@ impl KafkaServer {
         Ok(())
     }
 
-    pub fn run(&self) -> Result<(), std::io::Error> {
+    pub async fn run(&self) -> Result<(), std::io::Error> {
         println!("Starting Kafka server on port 9092");
-        
-        for stream_result in self.listener.incoming() {
-            match stream_result {
-                Ok(stream) => {
-                    let peer_addr = stream.peer_addr().unwrap_or_else(|_| "unknown".parse().unwrap());
-                    println!("New client connected from: {}", peer_addr);
-                    
-                    // Note: In a real implementation, you'd want to share the server instance
-                    // using Arc<Mutex<T>> or similar. For now, we're creating a dummy listener
-                    // just to satisfy the type system.
-                    thread::spawn(move || {
-                        let server = KafkaServer { 
-                            listener: TcpListener::bind("127.0.0.1:0").unwrap() 
-                        };
-                        if let Err(e) = server.handle_client(stream) {
-                            eprintln!("Client handling error: {}", e);
-                        }
-                    });
+
+        let listener = TcpListener::bind(&self.address).await?;
+
+        loop {
+            let (stream, addr) = listener.accept().await?;
+            println!("New client connected from: {}", addr);
+
+            let server_clone = KafkaServer {
+                address: self.address.clone(),
+            };
+
+            task::spawn(async move {
+                if let Err(e) = server_clone.handle_client(stream).await {
+                    eprintln!("Client handling error: {}", e);
                 }
-                Err(e) => {
-                    eprintln!("Failed to accept connection: {}", e);
-                }
-            }
+            });
         }
-        
-        Ok(())
     }
 }

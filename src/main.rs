@@ -1,4 +1,4 @@
-use rafka::kafka_server::KafkaServer;
+use rafka::network::server::KafkaServer;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

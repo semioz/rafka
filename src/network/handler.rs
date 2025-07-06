@@ -1,4 +1,4 @@
-use tokio::io::{AsyncReadExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
 use crate::error::ServerError;
@@ -27,4 +27,4 @@ impl MessageParser {
                 .map_err(|_| ServerError::InvalidMessageSize(-1))?
         ))
     }
-}
+} 

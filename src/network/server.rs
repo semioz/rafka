@@ -5,8 +5,8 @@ use tokio::task;
 use crate::{
     constants::MAX_MESSAGE_SIZE,
     error::ServerError,
-    protocol::{KafkaProtocolHandler, KafkaRequest},
-    message::MessageParser,
+    network::protocol::{KafkaProtocolHandler, KafkaRequest},
+    network::handler::MessageParser,
 };
 
 pub struct KafkaServer {
@@ -29,7 +29,7 @@ impl KafkaServer {
         Ok(())
     }
 
-    async fn  read_request(&self, stream: &mut TcpStream) -> Result<KafkaRequest, ServerError> {
+    async fn read_request(&self, stream: &mut TcpStream) -> Result<KafkaRequest, ServerError> {
         let message_size = MessageParser::read_i32_async(stream).await?;
         self.validate_message_size(message_size)?;
 
@@ -51,7 +51,6 @@ impl KafkaServer {
         })
     }
 
-    // multiple requests from a single client connection
     async fn handle_client(&self, mut stream: TcpStream) -> Result<(), ServerError> {
         let peer_addr = stream.peer_addr().unwrap_or_else(|e| {
             eprintln!("Failed to get peer address: {}", e);
@@ -103,4 +102,4 @@ impl KafkaServer {
             });
         }
     }
-}
+} 

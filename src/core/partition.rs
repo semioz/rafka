@@ -24,3 +24,21 @@ pub struct Message {
     pub key: Option<Vec<u8>>,
     pub value: Vec<u8>,
 }
+
+impl Partition {
+    pub fn new(id: i32, log: PartitionLog) -> Self {
+        Partition {
+            id,
+            log,
+            replicas: Vec::new(),
+            isr: Vec::new(),
+            leader: None,
+        }
+    }
+
+    /* 
+    pub fn append_message(&mut self, partition:Partition, message: Message) {
+        self.partitions
+    }
+    */
+}

@@ -1,4 +1,3 @@
-/*
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
@@ -38,4 +37,3 @@ pub enum GroupState {
     Stable,
     Dead,
 }
-*/

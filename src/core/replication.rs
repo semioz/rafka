@@ -1,4 +1,3 @@
-/*
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -17,7 +16,7 @@ pub struct LeaderState {
     topic: String,
     partition_id: i32,
     last_offset: i64,
-    isr: Vec<i32>,
+    isr: Vec<i32>, // in-sync replicas
     followers: HashMap<i32, FollowerProgress>,
 }
 
@@ -36,4 +35,3 @@ pub struct FollowerProgress {
     last_fetched_offset: i64,
     last_fetch_timestamp: i64,
 }
-*/

@@ -1,13 +1,14 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 #[derive(Debug)]
 pub struct Partition {
     id: i32,
-    log: PartitionLog,
-    replicas: Vec<i32>,  // broker IDs that host replicas
-    isr: Vec<i32>,       // in-sync replicas
-    leader: Option<i32>, // broker ID of the leader
+    log: RwLock<PartitionLog>,   
+    replicas: RwLock<Vec<i32>>,     
+    isr: RwLock<Vec<i32>>,          
+    leader: RwLock<Option<i32>>,
 }
 
 #[derive(Debug)]
@@ -53,16 +54,48 @@ impl PartitionLog {
             }
         }
     }
+
+    pub fn truncate_before_timestamp(&mut self, cutoff: i64) {
+        while let Some(front) = self.messages.front() {
+            if front.timestamp >= cutoff {
+                break;
+            }
+            if let Some(removed) = self.messages.pop_front() {
+                self.base_offset = removed.offset;
+            }
+        }
+    }
+
+    pub fn compact(&mut self) {
+        use std::collections::HashMap;
+        let mut latest_by_key: HashMap<Vec<u8>, Arc<Message>> = HashMap::new();
+
+        for msg in self.messages.iter() {
+            if let Some(key) = &msg.key {
+                latest_by_key.insert(key.clone(), Arc::clone(msg));
+            }
+        }
+
+        // reconstruct log from compacted messages
+        let mut compacted: Vec<_> = latest_by_key.into_values().collect();
+        compacted.sort_by_key(|m| m.offset); // maintain order
+
+        self.messages = compacted.into_iter().collect(); // into VecDeque
+        if let Some(front) = self.messages.front() {
+            self.base_offset = front.offset;
+        }
+    }
+
 }
 
 impl Partition {
-    pub fn new(id: i32, log: PartitionLog) -> Self {
+    pub fn new(id: i32) -> Self {
         Partition {
             id,
-            log,
-            replicas: Vec::new(),
-            isr: Vec::new(),
-            leader: None,
+            log: RwLock::new(PartitionLog::new()),
+            replicas: RwLock::new(Vec::new()),
+            isr: RwLock::new(Vec::new()),
+            leader: RwLock::new(None),
         }
     }
 
@@ -70,23 +103,24 @@ impl Partition {
         self.id
     }
 
-    pub fn append_message(&mut self, message: Message) {
+    pub async fn append_message(&self, message: Message) {
+        let mut log = self.log.write().await;
         // assign unique offset to new message
-        let offset = self.log.next_offset;
+        let offset = log.next_offset;
         let arc_message = Arc::new(Message {
             offset,
             ..message
         });
 
         // each partition is an append-only log.
-        self.log.messages.push_back(arc_message);
-        self.log.next_offset += 1;
+        log.messages.push_back(arc_message);
+        log.next_offset += 1;
     }
 
     // pull messages starting from a specific offset
-    pub fn read_from(&self, offset: i64, max_num_of_messages: usize) -> Vec<Arc<Message>> {
-        self.log
-            .messages
+    pub async fn read_from(&self, offset: i64, max_num_of_messages: usize) -> Vec<Arc<Message>> {
+        let log = self.log.read().await;
+        log.messages
             .iter()
             .filter(|msg| msg.offset >= offset)
             .take(max_num_of_messages)
@@ -94,32 +128,50 @@ impl Partition {
             .collect()
     }
 
-    pub fn clear_log(&mut self) {
-        self.log.messages.clear();
-        self.log.base_offset = self.log.next_offset;
+    pub async fn log_write(&self) -> tokio::sync::RwLockWriteGuard<'_, PartitionLog> {
+        self.log.write().await
     }
 
-    pub fn get_high_watermark(&self) -> i64 {
-        self.log.next_offset
+    pub async fn log_read(&self) -> tokio::sync::RwLockReadGuard<'_, PartitionLog> {
+        self.log.read().await
     }
 
-    pub fn set_leader(&mut self, broker_id: i32) {
-        self.leader = Some(broker_id);
+    pub async fn clear_log(&self) {
+        let mut log = self.log.write().await;
+        log.messages.clear();
+        log.base_offset = log.next_offset;
     }
 
-    /// adds a replica broker ID
-    pub fn add_replica(&mut self, broker_id: i32) {
-        if !self.replicas.contains(&broker_id) {
-            self.replicas.push(broker_id);
+    pub async fn get_high_watermark(&self) -> i64 {
+        let log = self.log.read().await;
+        log.next_offset
+    }
+
+    pub async fn set_leader(&self, broker_id: i32) {
+        let mut leader = self.leader.write().await;
+        *leader = Some(broker_id);
+    }
+
+    pub async fn add_replica(&self, broker_id: i32) {
+        let mut replicas = self.replicas.write().await;
+        if !replicas.contains(&broker_id) {
+            replicas.push(broker_id);
         }
     }
 
-    pub fn update_isr(&mut self, isr_list: Vec<i32>) {
-        self.isr = isr_list;
+    pub async fn update_isr(&self, isr_list: Vec<i32>) {
+        let mut isr = self.isr.write().await;
+        *isr = isr_list;
     }
 
-    pub fn is_leader(&self, broker_id: i32) -> bool {
-        self.leader == Some(broker_id)
+    pub async fn is_leader(&self, broker_id: i32) -> bool {
+        let leader = self.leader.read().await;
+        *leader == Some(broker_id)
+    }
+
+    pub async fn isr_count(&self) -> usize {
+        let isr = self.isr.read().await;
+        isr.len()
     }
 
 }

@@ -35,3 +35,6 @@ pub struct FollowerProgress {
     last_fetched_offset: i64,
     last_fetch_timestamp: i64,
 }
+
+impl ReplicaManager {
+}

@@ -4,6 +4,7 @@ use std::fs::{File, OpenOptions, create_dir_all};
 use fs2::FileExt;
 
 // entire commit log for a single partition
+#[derive(Debug)]
 pub struct Log {
     dir: PathBuf,
     active_segment: LogSegment,
@@ -12,6 +13,7 @@ pub struct Log {
 }
 
 // single file on disk storing a contiguous block of messages
+#[derive(Debug)]
 pub struct LogSegment {
     base_offset: i64,
     file: File,
